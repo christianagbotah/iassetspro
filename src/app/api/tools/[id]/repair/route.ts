@@ -24,6 +24,13 @@ export async function POST(
       return NextResponse.json({ success: false, error: 'Tool not found' }, { status: 404 });
     }
 
+    if ((tool.quantity ?? 0) > 1 || (tool.repairQuantity ?? 0) > 0) {
+      return NextResponse.json({
+        success: false,
+        error: 'Aggregate or repair-held tool custody must be managed through the damaged tool repair/QC workflow',
+      }, { status: 400 });
+    }
+
     if (!['available', 'checked_out', 'in_repair'].includes(tool.status)) {
       return NextResponse.json({ success: false, error: `Tool cannot be sent for repair from status: ${tool.status}` }, { status: 400 });
     }

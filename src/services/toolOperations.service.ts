@@ -3,6 +3,7 @@
  */
 import { db } from '@/lib/db';
 import { checkToolCalibration } from '@/services/toolCalibration.service';
+import { randomUUID } from 'node:crypto';
 
 const VALID_CONDITIONS = ['new', 'good', 'fair', 'poor', 'damaged'];
 
@@ -57,9 +58,9 @@ const detailedInclude = {
   storekeeperApprovedBy: { select: { id: true, fullName: true } },
   issuedByUser: { select: { id: true, fullName: true } },
   returnedByUser: { select: { id: true, fullName: true } },
-  workOrder: { select: { id: true, woNumber: true, title: true, status: true, assignedSupervisorId: true, plannerId: true, assignedSupervisor: { select: { id: true, fullName: true } } } },
-  tool: { select: { id: true, toolCode: true, name: true, status: true, category: true, condition: true, quantity: true, assignedToId: true, checkedOutAt: true } },
-  items: { include: { tool: { select: { id: true, toolCode: true, name: true, status: true, category: true, condition: true, quantity: true, assignedToId: true, checkedOutAt: true } } }, orderBy: { createdAt: 'asc' as const } },
+  workOrder: { select: { id: true, woNumber: true, title: true, status: true, plantId: true, assignedSupervisorId: true, plannerId: true, assignedSupervisor: { select: { id: true, fullName: true } } } },
+  tool: { select: { id: true, toolCode: true, name: true, status: true, category: true, condition: true, quantity: true, repairQuantity: true, assignedToId: true, checkedOutAt: true } },
+  items: { include: { tool: { select: { id: true, toolCode: true, name: true, status: true, category: true, condition: true, quantity: true, repairQuantity: true, assignedToId: true, checkedOutAt: true } } }, orderBy: { createdAt: 'asc' as const } },
 };
 
 function isConflict(error: unknown): boolean {
@@ -94,7 +95,7 @@ export async function atomicIssueTools(
 
       const toolReq = await tx.repairToolRequest.findUnique({
         where: { id: toolRequestId },
-        include: { items: { include: { tool: true } }, tool: true, workOrder: { select: { woNumber: true, plannerId: true } }, requestedBy: { select: { id: true, fullName: true } } },
+        include: { items: { include: { tool: true } }, tool: true, workOrder: { select: { woNumber: true, plannerId: true, plantId: true } }, requestedBy: { select: { id: true, fullName: true } } },
       });
       if (!toolReq) throw new Error('Tool request not found');
       if (currentRequest.status === 'issued' && toolReq.items.length === 0) {
@@ -392,7 +393,7 @@ export async function atomicConfirmToolReturn(
 
       const toolReq = await tx.repairToolRequest.findUnique({
         where: { id: toolRequestId },
-        include: { items: { include: { tool: true } }, tool: true, workOrder: { select: { woNumber: true, plannerId: true } }, requestedBy: { select: { id: true, fullName: true } } },
+        include: { items: { include: { tool: true } }, tool: true, workOrder: { select: { woNumber: true, plannerId: true, plantId: true } }, requestedBy: { select: { id: true, fullName: true } } },
       });
       if (!toolReq) throw new Error('Tool request not found');
 
@@ -414,18 +415,72 @@ export async function atomicConfirmToolReturn(
             if (tool.assignedToId && tool.assignedToId !== toolReq.requestedById) {
               throw new ToolOperationConflictError(`Tool "${item.toolName}" is assigned to a different custodian`);
             }
-            const toolStatus = condition === 'poor' || condition === 'damaged' ? 'in_repair' : 'available';
+            const requiresRepair = condition === 'poor' || condition === 'damaged';
+            const toolStatus = requiresRepair && tool.quantity <= 0 ? 'in_repair' : 'available';
             const toolClaim = await tx.tool.updateMany({
               where: { id: item.toolId, quantity: tool.quantity, status: tool.status, assignedToId: tool.assignedToId },
-              data: {
-                quantity: { increment: pendingQty },
-                status: toolStatus,
-                condition,
-                assignedToId: null,
-                checkedOutAt: null,
-              },
+              data: requiresRepair
+                ? {
+                    repairQuantity: { increment: pendingQty },
+                    status: toolStatus,
+                    ...(tool.quantity <= 0 ? { condition } : {}),
+                    assignedToId: null,
+                    checkedOutAt: null,
+                  }
+                : {
+                    quantity: { increment: pendingQty },
+                    status: toolStatus,
+                    condition,
+                    assignedToId: null,
+                    checkedOutAt: null,
+                  },
             });
             if (toolClaim.count !== 1) throw new ToolOperationConflictError(`Tool "${item.toolName}" changed concurrently during return`);
+
+            if (requiresRepair) {
+              const existingDamageReport = await tx.damagedToolReport.findFirst({
+                where: {
+                  toolId: item.toolId,
+                  workOrderId: toolReq.workOrderId,
+                  reportedById: toolReq.requestedById,
+                  status: { in: ['reported', 'assessed', 'repair_quoted', 'repair_in_progress'] },
+                },
+                orderBy: { createdAt: 'desc' },
+              });
+
+              if (existingDamageReport) {
+                await tx.damagedToolReport.update({
+                  where: { id: existingDamageReport.id },
+                  data: {
+                    toolRequestId: existingDamageReport.toolRequestId || toolRequestId,
+                    quantity: Math.max(
+                      existingDamageReport.quantity || 1,
+                      (existingDamageReport.repairHeldQuantity || 0) + pendingQty,
+                    ),
+                    repairHeldQuantity: { increment: pendingQty },
+                    damageDescription: item.pendingReturnNotes || existingDamageReport.damageDescription,
+                  },
+                });
+              } else {
+                await tx.damagedToolReport.create({
+                  data: {
+                    reportNumber: `DTR-AUTO-${now.getTime().toString(36).toUpperCase()}-${randomUUID().slice(0, 8).toUpperCase()}`,
+                    toolId: item.toolId,
+                    workOrderId: toolReq.workOrderId,
+                    toolRequestId: toolRequestId,
+                    damageType: condition === 'damaged' ? 'broken' : 'worn',
+                    damageSeverity: condition === 'damaged' ? 'high' : 'medium',
+                    damageDescription: item.pendingReturnNotes || `Returned in ${condition} condition from WO ${toolReq.workOrder.woNumber}`,
+                    quantity: pendingQty,
+                    repairHeldQuantity: pendingQty,
+                    reportedById: toolReq.requestedById,
+                    technicianId: toolReq.requestedById,
+                    plantId: toolReq.workOrder.plantId || tool.plantId || null,
+                    status: 'reported',
+                  },
+                });
+              }
+            }
 
             await tx.toolTransaction.create({
               data: {

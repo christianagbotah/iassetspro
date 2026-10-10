@@ -1777,7 +1777,7 @@ export function RepairToolRequestsPage() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatsCard icon={Clock} count={stats?.byStatus?.pending ?? requests.filter(r => r.status === 'pending').length} label="Pending" color="text-yellow-600" bgColor="bg-yellow-50" onClick={() => setFilterStatus('pending')} />
         <StatsCard icon={ShieldCheck} count={((stats?.byStatus?.supervisor_approved || 0) + (stats?.byStatus?.storekeeper_approved || 0)) || requests.filter(r => ['supervisor_approved', 'storekeeper_approved'].includes(r.status)).length} label="Awaiting Approval" color="text-sky-600" bgColor="bg-sky-50" onClick={() => setFilterStatus('supervisor_approved')} />
         <StatsCard icon={Wrench} count={stats?.byStatus?.issued ?? requests.filter(r => r.status === 'issued').length} label="Issued / Out" color="text-emerald-600" bgColor="bg-emerald-50" onClick={() => setFilterStatus('issued')} />
@@ -5031,7 +5031,9 @@ export function SparePartReturnsPage() {
 const DAMAGE_STAGES: PipelineStage[] = [
   { key: 'reported', label: 'Reported', icon: AlertTriangle },
   { key: 'assessed', label: 'Assessed', icon: Search },
+  { key: 'repair_quoted', label: 'Quoted', icon: DollarSign },
   { key: 'repair_in_progress', label: 'Repairing', icon: Wrench },
+  { key: 'awaiting_qc', label: 'Awaiting QC', icon: ShieldCheck },
   { key: 'repaired', label: 'Repaired', icon: CheckCircle2 },
   { key: 'written_off', label: 'Written Off', icon: Ban },
 ];
@@ -5052,11 +5054,12 @@ export function DamagedToolReportsPage() {
   const [submitting, setSubmitting] = useState(false);
   const [createForm, setCreateForm] = useState({
     toolId: '', workOrderId: '', damageType: 'broken', damageSeverity: 'medium',
-    damageDescription: '', occurredAt: '', technicianId: '',
+    damageDescription: '', occurredAt: '', technicianId: '', quantity: '1',
   });
   const [actionOpen, setActionOpen] = useState(false);
   const [actionTarget, setActionTarget] = useState<{ id: string; action: string } | null>(null);
   const [actionForm, setActionForm] = useState({ notes: '', estimatedCost: '', vendorName: '', reason: '' });
+  const canAcceptRepairQC = isAdmin() || Boolean(user?.roles?.some((role: any) => ['store_keeper', 'inventory_manager', 'tools_shop_attendant'].includes(role.slug)));
 
   const fetchReports = useCallback(async () => {
     setLoading(true);
@@ -5081,12 +5084,12 @@ export function DamagedToolReportsPage() {
     const res = await api.post('/api/repairs/damaged-tools', {
       toolId: createForm.toolId, workOrderId: createForm.workOrderId || undefined,
       damageType: createForm.damageType, damageSeverity: createForm.damageSeverity,
-      damageDescription: createForm.damageDescription,
+      damageDescription: createForm.damageDescription, quantity: parseInt(createForm.quantity, 10) || 1,
       occurredAt: createForm.occurredAt || undefined, technicianId: createForm.technicianId || undefined,
     });
     if (res.success) {
       toast.success('Damaged tool report created'); setCreateOpen(false);
-      setCreateForm({ toolId: '', workOrderId: '', damageType: 'broken', damageSeverity: 'medium', damageDescription: '', occurredAt: '', technicianId: '' });
+      setCreateForm({ toolId: '', workOrderId: '', damageType: 'broken', damageSeverity: 'medium', damageDescription: '', occurredAt: '', technicianId: '', quantity: '1' });
       fetchReports();
     } else toast.error(res.error || 'Failed');
     setSubmitting(false);
@@ -5127,6 +5130,7 @@ export function DamagedToolReportsPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsCard icon={AlertTriangle} count={stats?.byStatus?.reported ?? 0} label="Reported" color="text-red-600" bgColor="bg-red-50" onClick={() => { setFilterStatus('reported'); setPage(1); }} />
         <StatsCard icon={Wrench} count={stats?.byStatus?.repair_in_progress ?? 0} label="In Repair" color="text-blue-600" bgColor="bg-blue-50" onClick={() => { setFilterStatus('repair_in_progress'); setPage(1); }} />
+        <StatsCard icon={ShieldCheck} count={stats?.byStatus?.awaiting_qc ?? 0} label="Awaiting QC" color="text-violet-600" bgColor="bg-violet-50" onClick={() => { setFilterStatus('awaiting_qc'); setPage(1); }} />
         <StatsCard icon={CheckCircle2} count={stats?.byStatus?.repaired ?? 0} label="Repaired" color="text-emerald-600" bgColor="bg-emerald-50" onClick={() => { setFilterStatus('repaired'); setPage(1); }} />
         <StatsCard icon={Ban} count={stats?.byStatus?.written_off ?? 0} label="Written Off" color="text-gray-600" bgColor="bg-gray-50" onClick={() => { setFilterStatus('written_off'); setPage(1); }} />
       </div>
@@ -5144,6 +5148,7 @@ export function DamagedToolReportsPage() {
             <SelectItem value="assessed">Assessed</SelectItem>
             <SelectItem value="repair_quoted">Quoted</SelectItem>
             <SelectItem value="repair_in_progress">In Repair</SelectItem>
+            <SelectItem value="awaiting_qc">Awaiting QC</SelectItem>
             <SelectItem value="repaired">Repaired</SelectItem>
             <SelectItem value="written_off">Written Off</SelectItem>
           </SelectContent>
@@ -5201,14 +5206,24 @@ export function DamagedToolReportsPage() {
                               <Search className="h-3.5 w-3.5" /> Assess
                             </Button>
                           )}
-                          {r.status === 'assessed' && (isAdmin() || hasPermission('damaged_tool_reports.update')) && (
-                            <Button size="sm" className="h-7 gap-1 bg-violet-600 hover:bg-violet-700 text-white" onClick={() => { setActionTarget({ id: r.id, action: 'start_repair' }); setActionForm({ notes: '', estimatedCost: '', vendorName: '', reason: '' }); setActionOpen(true); }}>
+                          {r.status === 'assessed' && canAcceptRepairQC && (
+                            <Button size="sm" className="h-7 gap-1 bg-violet-600 hover:bg-violet-700 text-white" onClick={() => { setActionTarget({ id: r.id, action: 'quote_repair' }); setActionForm({ notes: '', estimatedCost: r.estimatedRepairCost ? String(r.estimatedRepairCost) : '', vendorName: '', reason: '' }); setActionOpen(true); }}>
+                              <DollarSign className="h-3.5 w-3.5" /> Quote Repair
+                            </Button>
+                          )}
+                          {r.status === 'repair_quoted' && (isAdmin() || hasPermission('damaged_tool_reports.update')) && (
+                            <Button size="sm" className="h-7 gap-1 bg-blue-600 hover:bg-blue-700 text-white" onClick={() => handleAction(r.id, 'start_repair')}>
                               <Wrench className="h-3.5 w-3.5" /> Start Repair
                             </Button>
                           )}
                           {r.status === 'repair_in_progress' && (isAdmin() || hasPermission('damaged_tool_reports.update')) && (
                             <Button size="sm" className="h-7 gap-1 bg-emerald-600 hover:bg-emerald-700 text-white" onClick={() => handleAction(r.id, 'complete_repair')}>
                               <CheckCircle2 className="h-3.5 w-3.5" /> Complete
+                            </Button>
+                          )}
+                          {r.status === 'awaiting_qc' && canAcceptRepairQC && (
+                            <Button size="sm" className="h-7 gap-1 bg-violet-600 hover:bg-violet-700 text-white" onClick={() => { setActionTarget({ id: r.id, action: 'accept_repair' }); setActionForm({ notes: '', estimatedCost: '', vendorName: '', reason: '' }); setActionOpen(true); }}>
+                              <ShieldCheck className="h-3.5 w-3.5" /> Accept QC
                             </Button>
                           )}
                           <DropdownMenu>
@@ -5246,15 +5261,28 @@ export function DamagedToolReportsPage() {
             </div>
           </>
         )}
-        {actionTarget?.action === 'start_repair' && (
+        {actionTarget?.action === 'quote_repair' && (
           <>
-            <div className="space-y-1.5 mb-4"><h2 className="text-lg font-semibold">Start Repair</h2><p className="text-sm text-muted-foreground">Begin the repair process.</p></div>
+            <div className="space-y-1.5 mb-4"><h2 className="text-lg font-semibold">Quote Repair</h2><p className="text-sm text-muted-foreground">Record the repair vendor and estimated cost before work starts.</p></div>
             <div className="space-y-3">
               <div className="space-y-2"><Label>Repair Vendor</Label><Input value={actionForm.vendorName} onChange={e => setActionForm(p => ({ ...p, vendorName: e.target.value }))} placeholder="Vendor or in-house" /></div>
+              <div className="space-y-2"><Label>Estimated Repair Cost</Label><Input type="number" min="0" step="0.01" value={actionForm.estimatedCost} onChange={e => setActionForm(p => ({ ...p, estimatedCost: e.target.value }))} placeholder="0.00" /></div>
               <div className="space-y-2"><Label>Notes</Label><Textarea value={actionForm.notes} onChange={e => setActionForm(p => ({ ...p, notes: e.target.value }))} rows={2} /></div>
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
                 <Button variant="outline" onClick={() => setActionOpen(false)}>Cancel</Button>
-                <Button className="bg-violet-600 hover:bg-violet-700 text-white" disabled={submitting} onClick={() => handleAction(actionTarget.id, 'start_repair', { repairVendorName: actionForm.vendorName || undefined })}>Start Repair</Button>
+                <Button className="bg-violet-600 hover:bg-violet-700 text-white" disabled={submitting} onClick={() => handleAction(actionTarget.id, 'quote_repair', { repairVendorName: actionForm.vendorName || undefined, estimatedRepairCost: actionForm.estimatedCost ? parseFloat(actionForm.estimatedCost) : undefined })}>Save Quote</Button>
+              </div>
+            </div>
+          </>
+        )}
+        {actionTarget?.action === 'accept_repair' && (
+          <>
+            <div className="space-y-1.5 mb-4"><h2 className="text-lg font-semibold">Accept Repaired Tool</h2><p className="text-sm text-muted-foreground">Confirm functional inspection/QC before returning repaired quantity to usable tool stock.</p></div>
+            <div className="space-y-3">
+              <div className="space-y-2"><Label htmlFor="damaged-tool-qc-notes">QC Notes</Label><Textarea id="damaged-tool-qc-notes" value={actionForm.notes} onChange={e => setActionForm(p => ({ ...p, notes: e.target.value }))} rows={3} placeholder="Functional test, inspection result, calibration check..." /></div>
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button variant="outline" onClick={() => setActionOpen(false)}>Cancel</Button>
+                <Button className="bg-violet-600 hover:bg-violet-700 text-white" disabled={submitting} onClick={() => handleAction(actionTarget.id, 'accept_repair', { qcNotes: actionForm.notes || undefined })}><ShieldCheck className="h-4 w-4 mr-2" />Accept QC</Button>
               </div>
             </div>
           </>
@@ -5292,6 +5320,10 @@ export function DamagedToolReportsPage() {
               if (res.success) return (res.data || []).map((wo: any) => ({ value: wo.id, label: `${wo.woNumber} - ${wo.title}` }));
               return [];
             }} value={createForm.workOrderId} onValueChange={v => setCreateForm(p => ({ ...p, workOrderId: v }))} />
+          </div>
+          <div className="space-y-2">
+            <Label>Damaged Quantity *</Label>
+            <Input type="number" min="1" step="1" value={createForm.quantity} onChange={e => setCreateForm(p => ({ ...p, quantity: e.target.value }))} />
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
@@ -5369,6 +5401,7 @@ export function DamagedToolReportsPage() {
                     { label: 'Assessed', date: detailItem.assessedAt, notes: detailItem.assessmentNotes },
                     { label: 'Repair Started', date: detailItem.repairStartedAt },
                     { label: 'Repair Completed', date: detailItem.repairCompletedAt },
+                    { label: 'QC Accepted', date: detailItem.qcAcceptedAt, notes: detailItem.qcNotes },
                     { label: 'Written Off', date: detailItem.writtenOffAt, notes: detailItem.writeOffReason },
                   ].filter(e => e.date)} />
                 </TabsContent>

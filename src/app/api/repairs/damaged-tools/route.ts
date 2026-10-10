@@ -3,7 +3,7 @@ import { db } from '@/lib/db';
 import { getSession, isAdmin, hasRole } from '@/lib/auth';
 import { createAuditLog } from '@/lib/audit';
 import { notifyUser } from '@/lib/notifications';
-import { getPlantScope, applyPlantScope } from '@/lib/plant-scope';
+import { getPlantScope, applyPlantScope, canAccessPlantStrict } from '@/lib/plant-scope';
 
 // Helper: generate auto-number DTR-YYYYMM-NNNN
 async function generateReportNumber(): Promise<string> {
@@ -178,6 +178,7 @@ export async function POST(request: NextRequest) {
       occurredAt,
       technicianId,
       plantId,
+      quantity: quantityInput,
     } = body;
 
     if (!toolId || !damageType || !damageDescription) {
@@ -185,6 +186,10 @@ export async function POST(request: NextRequest) {
         { success: false, error: 'toolId, damageType, and damageDescription are required' },
         { status: 400 },
       );
+    }
+    const quantity = Number.parseInt(String(quantityInput ?? 1), 10);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return NextResponse.json({ success: false, error: 'quantity must be a positive whole number' }, { status: 400 });
     }
 
     // Verify tool exists
@@ -195,18 +200,53 @@ export async function POST(request: NextRequest) {
     if (!tool) {
       return NextResponse.json({ success: false, error: 'Tool not found' }, { status: 404 });
     }
+    if (plantId && tool.plantId && plantId !== tool.plantId) {
+      return NextResponse.json({ success: false, error: 'Reported plant does not match the tool plant' }, { status: 400 });
+    }
 
-    // Resolve plantId
+    // Resolve and enforce plant custody before any stock mutation.
     const resolvedPlantId = plantId || tool.plantId || null;
+    const plantScope = await getPlantScope(request, session);
+    if (plantScope.denyAccess || !canAccessPlantStrict(plantScope, resolvedPlantId)) {
+      return NextResponse.json({ success: false, error: 'Access denied' }, { status: 403 });
+    }
 
     // Resolve technicianId to the tool's current assignee if not provided
     const resolvedTechnicianId = technicianId || tool.assignedToId || null;
 
     const reportNumber = await generateReportNumber();
+    const storeHeldDamage = !workOrderId && !toolRequestId && !tool.assignedToId && tool.status === 'available';
+    if (storeHeldDamage && quantity > tool.quantity) {
+      return NextResponse.json(
+        { success: false, error: `Damage quantity (${quantity}) exceeds usable store stock (${tool.quantity})` },
+        { status: 400 },
+      );
+    }
 
-    // Create report and update tool status in a transaction
-    const [report] = await db.$transaction([
-      db.damagedToolReport.create({
+    const report = await db.$transaction(async (tx) => {
+      let repairHeldQuantity = 0;
+      if (storeHeldDamage) {
+        const remainingUsable = tool.quantity - quantity;
+        const toolClaim = await tx.tool.updateMany({
+          where: {
+            id: toolId,
+            quantity: tool.quantity,
+            repairQuantity: tool.repairQuantity,
+            status: tool.status,
+            assignedToId: tool.assignedToId,
+          },
+          data: {
+            quantity: { decrement: quantity },
+            repairQuantity: { increment: quantity },
+            status: remainingUsable > 0 ? 'available' : 'in_repair',
+            ...(remainingUsable <= 0 ? { condition: damageSeverity === 'low' ? 'poor' : 'damaged' } : {}),
+          },
+        });
+        if (toolClaim.count !== 1) throw new Error('Tool stock/custody changed concurrently while reporting damage');
+        repairHeldQuantity = quantity;
+      }
+
+      const created = await tx.damagedToolReport.create({
         data: {
           reportNumber,
           toolId,
@@ -216,6 +256,8 @@ export async function POST(request: NextRequest) {
           damageSeverity: damageSeverity || 'medium',
           damageDescription,
           damagePhotoUrls: damagePhotoUrls || '[]',
+          quantity,
+          repairHeldQuantity,
           occurredAt: occurredAt ? new Date(occurredAt) : null,
           reportedById: session.userId,
           technicianId: resolvedTechnicianId,
@@ -227,22 +269,22 @@ export async function POST(request: NextRequest) {
           reportedBy: { select: { id: true, fullName: true } },
           technician: { select: { id: true, fullName: true } },
         },
-      }),
-      // Auto-update tool status to 'in_repair'
-      db.tool.update({
-        where: { id: toolId },
-        data: { status: 'in_repair' },
-      }),
-      // Create tool transaction record
-      db.toolTransaction.create({
+      });
+
+      await tx.toolTransaction.create({
         data: {
           toolId,
-          type: 'repair_start',
-          notes: `Damage reported: ${reportNumber}`,
+          type: storeHeldDamage ? 'repair_start' : 'damage_report',
+          notes: storeHeldDamage
+            ? `Damage reported and ${quantity}x quarantined for repair: ${reportNumber}`
+            : `Operational damage reported; physical custody pending return: ${reportNumber}`,
           performedById: session.userId,
+          workOrderId: workOrderId || null,
         },
-      }),
-    ]);
+      });
+
+      return created;
+    });
 
     // Audit log
     await createAuditLog(session.userId, 'DamagedToolReport', 'create', report.id, {

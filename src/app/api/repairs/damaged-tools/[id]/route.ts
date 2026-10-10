@@ -189,7 +189,7 @@ export async function POST(
         return NextResponse.json({ success: false, error: 'Only maintenance or store roles can assess damage' }, { status: 403 });
       }
     }
-    if (action === 'quote_repair' || action === 'write_off' || action === 'replace') {
+    if (action === 'quote_repair' || action === 'write_off' || action === 'replace' || action === 'accept_repair') {
       if (!isStoreRole) {
         return NextResponse.json({ success: false, error: 'Only store/inventory roles can manage repair costs and tool replacement' }, { status: 403 });
       }
@@ -220,6 +220,25 @@ export async function POST(
     }
 
     const now = new Date();
+
+    // Operational damage can be reported before the damaged unit is physically
+    // returned. Do not allow repair/terminal actions to mutate aggregate tool
+    // custody until the returned quantity is actually held for repair. Existing
+    // legacy reports that already put the Tool row in `in_repair` remain usable.
+    const actionsRequiringPhysicalRepairCustody = new Set([
+      'quote_repair', 'start_repair', 'complete_repair', 'accept_repair', 'write_off', 'replace',
+    ]);
+    const physicalRepairCustodyPending = Boolean(
+      existing.workOrderId
+      && Number(existing.repairHeldQuantity || 0) <= 0
+      && existing.tool?.status !== 'in_repair'
+    );
+    if (actionsRequiringPhysicalRepairCustody.has(action) && physicalRepairCustodyPending) {
+      return NextResponse.json({
+        success: false,
+        error: 'Confirm the damaged tool physical return into repair custody before continuing this repair action',
+      }, { status: 409 });
+    }
 
     if (action === 'assess') {
       if (existing.status !== 'reported') {
@@ -317,7 +336,7 @@ export async function POST(
         db.damagedToolReport.update({
           where: { id },
           data: {
-            status: 'repaired',
+            status: 'awaiting_qc',
             actualRepairCost: actualRepairCost ?? null,
             repairCompletedAt: now,
             repairCompletedById: session.userId,
@@ -328,22 +347,18 @@ export async function POST(
             reportedBy: { select: { id: true, fullName: true } },
           },
         }),
-        db.tool.update({
-          where: { id: existing.toolId },
-          data: { status: 'available', condition: 'good' },
-        }),
         db.toolTransaction.create({
           data: {
             toolId: existing.toolId,
             type: 'repair_complete',
-            notes: `Repair completed: ${existing.reportNumber}`,
+            notes: `Repair completed, awaiting store/QC acceptance: ${existing.reportNumber}`,
             performedById: session.userId,
           },
         }),
       ]);
 
       await createAuditLog(session.userId, 'DamagedToolReport', 'complete_repair', id, {
-        newValues: { status: 'repaired', actualRepairCost },
+        newValues: { status: 'awaiting_qc', actualRepairCost },
       });
 
       const notifyIds = [existing.reportedById, existing.technicianId].filter(Boolean) as string[];
@@ -351,8 +366,8 @@ export async function POST(
         await notifyUser(
           uid,
           'tool_repair_completed',
-          'Tool Repair Completed',
-          `${existing.reportNumber}: ${existing.tool?.name || 'Tool'} has been repaired`,
+          'Tool Repair Completed — Awaiting QC',
+          `${existing.reportNumber}: ${existing.tool?.name || 'Tool'} repair is complete and awaiting store/QC acceptance`,
           'damaged_tool', id, 'damaged-tools',
         ).catch(() => {});
       }
@@ -360,8 +375,72 @@ export async function POST(
       return NextResponse.json({ success: true, data: updated });
     }
 
+    if (action === 'accept_repair') {
+      if (existing.status !== 'awaiting_qc') {
+        return NextResponse.json({ success: false, error: `Cannot accept repair: current status is '${existing.status}', expected 'awaiting_qc'` }, { status: 400 });
+      }
+
+      const heldQuantity = Math.max(0, Number(existing.repairHeldQuantity || 0));
+      const toolRepairQuantity = Math.max(0, Number(existing.tool?.repairQuantity || 0));
+      if (heldQuantity > toolRepairQuantity) {
+        return NextResponse.json({ success: false, error: `Repair custody mismatch: report holds ${heldQuantity}, tool repair custody has ${toolRepairQuantity}` }, { status: 409 });
+      }
+      const qcNotes = typeof body.qcNotes === 'string' ? body.qcNotes.trim() : '';
+
+      const updated = await db.$transaction(async (tx) => {
+        const reportClaim = await tx.damagedToolReport.updateMany({
+          where: { id, status: 'awaiting_qc', repairHeldQuantity: existing.repairHeldQuantity },
+          data: {
+            status: 'repaired',
+            repairHeldQuantity: 0,
+            qcAcceptedById: session.userId,
+            qcAcceptedAt: now,
+            qcNotes: qcNotes || null,
+          },
+        });
+        if (reportClaim.count !== 1) throw new Error('Damaged tool report changed concurrently during QC acceptance');
+
+        if (heldQuantity > 0) {
+          const toolClaim = await tx.tool.updateMany({
+            where: { id: existing.toolId, repairQuantity: toolRepairQuantity },
+            data: {
+              quantity: { increment: heldQuantity },
+              repairQuantity: { decrement: heldQuantity },
+              status: 'available',
+              condition: 'good',
+            },
+          });
+          if (toolClaim.count !== 1) throw new Error('Tool repair custody changed concurrently during QC acceptance');
+        }
+
+        await tx.toolTransaction.create({
+          data: {
+            toolId: existing.toolId,
+            type: 'repair_qc_accept',
+            notes: `QC accepted ${heldQuantity}x repaired unit(s): ${existing.reportNumber}${qcNotes ? ` — ${qcNotes}` : ''}`,
+            performedById: session.userId,
+          },
+        });
+
+        return tx.damagedToolReport.findUnique({
+          where: { id },
+          include: {
+            tool: { select: { id: true, toolCode: true, name: true, quantity: true, repairQuantity: true, status: true, condition: true } },
+            repairCompletedBy: { select: { id: true, fullName: true } },
+            reportedBy: { select: { id: true, fullName: true } },
+          },
+        });
+      });
+
+      await createAuditLog(session.userId, 'DamagedToolReport', 'accept_repair', id, {
+        newValues: { status: 'repaired', releasedQuantity: heldQuantity, qcNotes: qcNotes || null },
+      });
+
+      return NextResponse.json({ success: true, data: updated });
+    }
+
     if (action === 'write_off') {
-      if (!['reported', 'assessed', 'repair_quoted', 'repair_in_progress'].includes(existing.status)) {
+      if (!['reported', 'assessed', 'repair_quoted', 'repair_in_progress', 'awaiting_qc'].includes(existing.status)) {
         return NextResponse.json({ success: false, error: `Cannot write off: current status is '${existing.status}'` }, { status: 400 });
       }
 
@@ -370,95 +449,123 @@ export async function POST(
         return NextResponse.json({ success: false, error: 'writeOffReason is required' }, { status: 400 });
       }
 
-      const [updated] = await db.$transaction([
-        db.damagedToolReport.update({
-          where: { id },
+      const heldQuantity = Math.max(0, Number(existing.repairHeldQuantity || 0));
+      const toolRepairQuantity = Math.max(0, Number(existing.tool?.repairQuantity || 0));
+      const usableQuantity = Math.max(0, Number(existing.tool?.quantity || 0));
+      if (heldQuantity > toolRepairQuantity) {
+        return NextResponse.json({ success: false, error: `Repair custody mismatch: report holds ${heldQuantity}, tool repair custody has ${toolRepairQuantity}` }, { status: 409 });
+      }
+
+      const updated = await db.$transaction(async (tx) => {
+        const reportClaim = await tx.damagedToolReport.updateMany({
+          where: { id, status: existing.status, repairHeldQuantity: existing.repairHeldQuantity },
           data: {
             status: 'written_off',
+            repairHeldQuantity: 0,
             writtenOffById: session.userId,
             writtenOffAt: now,
             writeOffReason,
           },
-          include: {
-            tool: { select: { id: true, toolCode: true, name: true } },
-            writtenOffBy: { select: { id: true, fullName: true } },
-            reportedBy: { select: { id: true, fullName: true } },
-          },
-        }),
-        db.tool.update({
-          where: { id: existing.toolId },
-          data: { status: 'retired' },
-        }),
-        db.toolTransaction.create({
+        });
+        if (reportClaim.count !== 1) throw new Error('Damaged tool report changed concurrently during write-off');
+
+        if (heldQuantity > 0) {
+          const remainingRepair = toolRepairQuantity - heldQuantity;
+          const nextStatus = usableQuantity > 0 ? 'available' : remainingRepair > 0 ? 'in_repair' : 'retired';
+          const toolClaim = await tx.tool.updateMany({
+            where: { id: existing.toolId, repairQuantity: toolRepairQuantity },
+            data: { repairQuantity: { decrement: heldQuantity }, status: nextStatus },
+          });
+          if (toolClaim.count !== 1) throw new Error('Tool repair custody changed concurrently during write-off');
+        } else {
+          await tx.tool.update({ where: { id: existing.toolId }, data: { status: 'retired' } });
+        }
+
+        await tx.toolTransaction.create({
           data: {
             toolId: existing.toolId,
             type: 'retire',
-            notes: `Written off: ${existing.reportNumber} - ${writeOffReason}`,
+            notes: `Written off ${heldQuantity || 1}x damaged unit(s): ${existing.reportNumber} - ${writeOffReason}`,
             performedById: session.userId,
           },
-        }),
-      ]);
+        });
+
+        return tx.damagedToolReport.findUnique({
+          where: { id },
+          include: {
+            tool: { select: { id: true, toolCode: true, name: true, quantity: true, repairQuantity: true, status: true } },
+            writtenOffBy: { select: { id: true, fullName: true } },
+            reportedBy: { select: { id: true, fullName: true } },
+          },
+        });
+      });
 
       await createAuditLog(session.userId, 'DamagedToolReport', 'write_off', id, {
-        newValues: { status: 'written_off', writeOffReason },
+        newValues: { status: 'written_off', writeOffReason, writtenOffQuantity: heldQuantity || 1 },
       });
 
       return NextResponse.json({ success: true, data: updated });
     }
 
     if (action === 'replace') {
-      if (!['reported', 'assessed', 'repair_quoted', 'repair_in_progress'].includes(existing.status)) {
+      if (!['reported', 'assessed', 'repair_quoted', 'repair_in_progress', 'awaiting_qc'].includes(existing.status)) {
         return NextResponse.json({ success: false, error: `Cannot replace: current status is '${existing.status}'` }, { status: 400 });
       }
 
       const { replacedWithToolId } = body;
+      const heldQuantity = Math.max(0, Number(existing.repairHeldQuantity || 0));
+      const toolRepairQuantity = Math.max(0, Number(existing.tool?.repairQuantity || 0));
+      const usableQuantity = Math.max(0, Number(existing.tool?.quantity || 0));
+      if (heldQuantity > toolRepairQuantity) {
+        return NextResponse.json({ success: false, error: `Repair custody mismatch: report holds ${heldQuantity}, tool repair custody has ${toolRepairQuantity}` }, { status: 409 });
+      }
 
-      const [updated] = await db.$transaction([
-        db.damagedToolReport.update({
-          where: { id },
-          data: {
-            status: 'replaced',
-            replacedWithToolId: replacedWithToolId || null,
-          },
-          include: {
-            tool: { select: { id: true, toolCode: true, name: true } },
-            reportedBy: { select: { id: true, fullName: true } },
-          },
-        }),
-        db.tool.update({
-          where: { id: existing.toolId },
-          data: { status: 'retired' },
-        }),
-        db.toolTransaction.create({
+      const updated = await db.$transaction(async (tx) => {
+        const reportClaim = await tx.damagedToolReport.updateMany({
+          where: { id, status: existing.status, repairHeldQuantity: existing.repairHeldQuantity },
+          data: { status: 'replaced', repairHeldQuantity: 0, replacedWithToolId: replacedWithToolId || null },
+        });
+        if (reportClaim.count !== 1) throw new Error('Damaged tool report changed concurrently during replacement');
+
+        if (heldQuantity > 0) {
+          const remainingRepair = toolRepairQuantity - heldQuantity;
+          const nextStatus = usableQuantity > 0 ? 'available' : remainingRepair > 0 ? 'in_repair' : 'retired';
+          const toolClaim = await tx.tool.updateMany({
+            where: { id: existing.toolId, repairQuantity: toolRepairQuantity },
+            data: { repairQuantity: { decrement: heldQuantity }, status: nextStatus },
+          });
+          if (toolClaim.count !== 1) throw new Error('Tool repair custody changed concurrently during replacement');
+        } else {
+          await tx.tool.update({ where: { id: existing.toolId }, data: { status: 'retired' } });
+        }
+
+        await tx.toolTransaction.create({
           data: {
             toolId: existing.toolId,
             type: 'retire',
-            notes: `Replaced: ${existing.reportNumber}`,
+            notes: `Replaced ${heldQuantity || 1}x damaged unit(s): ${existing.reportNumber}${replacedWithToolId ? ` → ${replacedWithToolId}` : ''}`,
             performedById: session.userId,
           },
-        }),
-      ]);
+        });
 
-      if (replacedWithToolId) {
-        try {
-          await db.tool.update({
-            where: { id: replacedWithToolId },
-            data: { status: 'available' },
-          });
-        } catch (err) {
-          console.error('[damaged-tools] Failed to update replacement tool status:', err);
-        }
-      }
+        return tx.damagedToolReport.findUnique({
+          where: { id },
+          include: {
+            tool: { select: { id: true, toolCode: true, name: true, quantity: true, repairQuantity: true, status: true } },
+            reportedBy: { select: { id: true, fullName: true } },
+          },
+        });
+      });
 
       await createAuditLog(session.userId, 'DamagedToolReport', 'replace', id, {
-        newValues: { status: 'replaced', replacedWithToolId },
+        newValues: { status: 'replaced', replacedWithToolId, replacedQuantity: heldQuantity || 1 },
       });
 
       await notifyUser(
         existing.reportedById,
         'tool_replaced',
         'Damaged Tool Replaced',
-        `${existing.reportNumber}: ${existing.tool?.name || 'Tool'} has been replaced${replacedWithToolId ? ' with a new tool' : ''}`,
+        `${existing.reportNumber}: ${existing.tool?.name || 'Tool'} damaged unit has been replaced${replacedWithToolId ? ' with a recorded replacement tool' : ''}`,
         'damaged_tool', id, 'damaged-tools',
       ).catch(() => {});
 

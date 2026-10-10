@@ -17,6 +17,9 @@ const {
   mockTxItemUpdate,
   mockTxToolUpdate,
   mockTxToolTransactionCreate,
+  mockTxDamagedToolReportCreate,
+  mockTxDamagedToolReportFindFirst,
+  mockTxDamagedToolReportUpdate,
   mockTxRequestUpdate,
   mockTxItemFindMany,
   mockCheckToolCalibration,
@@ -32,6 +35,9 @@ const {
   mockTxItemUpdate: vi.fn().mockResolvedValue({}),
   mockTxToolUpdate: vi.fn().mockResolvedValue({}),
   mockTxToolTransactionCreate: vi.fn().mockResolvedValue({}),
+  mockTxDamagedToolReportCreate: vi.fn().mockResolvedValue({ id: 'dtr-1' }),
+  mockTxDamagedToolReportFindFirst: vi.fn().mockResolvedValue(null),
+  mockTxDamagedToolReportUpdate: vi.fn().mockResolvedValue({ id: 'dtr-existing' }),
   mockTxRequestUpdate: vi.fn().mockResolvedValue({}),
   mockTxItemFindMany: vi.fn().mockResolvedValue([]),
   mockCheckToolCalibration: vi.fn(),
@@ -64,7 +70,8 @@ function makeToolRequest(overrides: Record<string, unknown> = {}) {
     issuedAt: null,
     returnConfirmedById: null,
     returnConfirmedAt: null,
-    workOrder: { woNumber: 'WO-202506-0001', plannerId: 'planner-1' },
+    workOrderId: 'wo-1',
+    workOrder: { woNumber: 'WO-202506-0001', plannerId: 'planner-1', plantId: 'plant-a' },
     requestedBy: { id: 'tech-1', fullName: 'Tech One' },
     items: [],
     tool: null,
@@ -102,6 +109,7 @@ function makeTool(overrides: Record<string, unknown> = {}) {
     status: 'available',
     condition: 'good',
     quantity: 5,
+    repairQuantity: 0,
     assignedToId: null,
     checkedOutAt: null,
     ...overrides,
@@ -148,6 +156,11 @@ function setupTransactionWithMockTx(toolRequestData: Record<string, unknown> | n
     },
     toolTransaction: {
       create: mockTxToolTransactionCreate,
+    },
+    damagedToolReport: {
+      findFirst: mockTxDamagedToolReportFindFirst,
+      create: mockTxDamagedToolReportCreate,
+      update: mockTxDamagedToolReportUpdate,
     },
   };
 
@@ -958,6 +971,109 @@ describe('atomicConfirmToolReturn - multi-item return', () => {
         data: expect.objectContaining({ status: 'in_repair' }),
       }),
     );
+  });
+
+  it('keeps damaged returned units out of usable stock and moves only those units into repair custody', async () => {
+    const items = [
+      makeToolRequestItem({
+        id: 'tri-1',
+        toolId: 'tool-1',
+        toolName: 'Torque Wrench',
+        quantityIssued: 2,
+        pendingReturnQty: 1,
+        pendingReturnCondition: 'damaged',
+      }),
+    ];
+
+    const mockTx = setupTransactionWithMockTx(
+      makeToolRequest({ status: 'pending_return', items }),
+    );
+    (mockTx.tool.findUnique as Mock).mockResolvedValue(
+      makeTool({ id: 'tool-1', quantity: 1, repairQuantity: 0, status: 'available' }),
+    );
+    mockTxItemFindMany.mockResolvedValue([
+      { ...items[0], quantityReturned: 1, quantityTransferred: 0 },
+    ]);
+
+    const result = await atomicConfirmToolReturn('tr-1', session);
+
+    expect(result.success).toBe(true);
+    expect(mockTxToolUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          repairQuantity: { increment: 1 },
+          status: 'available',
+        }),
+      }),
+    );
+    const toolUpdate = mockTxToolUpdate.mock.calls.find((call) => call[0]?.where?.id === 'tool-1')?.[0];
+    expect(toolUpdate?.data?.quantity).toBeUndefined();
+  });
+
+  it('creates a quantity-linked damage report when store confirms a damaged return', async () => {
+    const items = [
+      makeToolRequestItem({
+        id: 'tri-1',
+        toolId: 'tool-1',
+        toolName: 'Torque Wrench',
+        quantityIssued: 2,
+        pendingReturnQty: 1,
+        pendingReturnCondition: 'damaged',
+        pendingReturnNotes: 'Ratchet head cracked',
+      }),
+    ];
+
+    const mockTx = setupTransactionWithMockTx(
+      makeToolRequest({ status: 'pending_return', items }),
+    );
+    (mockTx.tool.findUnique as Mock).mockResolvedValue(
+      makeTool({ id: 'tool-1', quantity: 1, repairQuantity: 0, status: 'available' }),
+    );
+    mockTxItemFindMany.mockResolvedValue([
+      { ...items[0], quantityReturned: 1, quantityTransferred: 0 },
+    ]);
+
+    const result = await atomicConfirmToolReturn('tr-1', session);
+
+    expect(result.success).toBe(true);
+    expect(mockTxDamagedToolReportCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          toolId: 'tool-1',
+          workOrderId: 'wo-1',
+          toolRequestId: 'tr-1',
+          quantity: 1,
+          repairHeldQuantity: 1,
+          reportedById: 'tech-1',
+          technicianId: 'tech-1',
+          status: 'reported',
+        }),
+      }),
+    );
+  });
+
+  it('attaches physical repair custody to an existing operational damage report instead of creating a duplicate', async () => {
+    const items = [
+      makeToolRequestItem({
+        id: 'tri-1', toolId: 'tool-1', toolName: 'Torque Wrench', quantityIssued: 2,
+        pendingReturnQty: 1, pendingReturnCondition: 'damaged', pendingReturnNotes: 'Ratchet cracked',
+      }),
+    ];
+    const mockTx = setupTransactionWithMockTx(makeToolRequest({ status: 'pending_return', items }));
+    (mockTx.tool.findUnique as Mock).mockResolvedValue(makeTool({ id: 'tool-1', quantity: 1, repairQuantity: 0, status: 'available' }));
+    mockTxDamagedToolReportFindFirst.mockResolvedValue({
+      id: 'dtr-existing', quantity: 1, repairHeldQuantity: 0, toolRequestId: null,
+    });
+    mockTxItemFindMany.mockResolvedValue([{ ...items[0], quantityReturned: 1, quantityTransferred: 0 }]);
+
+    const result = await atomicConfirmToolReturn('tr-1', session);
+
+    expect(result.success).toBe(true);
+    expect(mockTxDamagedToolReportCreate).not.toHaveBeenCalled();
+    expect(mockTxDamagedToolReportUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'dtr-existing' },
+      data: expect.objectContaining({ toolRequestId: 'tr-1', quantity: 1, repairHeldQuantity: { increment: 1 } }),
+    }));
   });
 
   it('should detect allReturned=false when items still outstanding', async () => {

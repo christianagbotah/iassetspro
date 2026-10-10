@@ -69,12 +69,21 @@ export async function PUT(
       );
     }
 
-    // Build update data
+    const custodyFields = ['quantity', 'repairQuantity', 'status', 'condition', 'assignedToId', 'expectedReturn', 'isActive'];
+    const attemptedCustodyFields = custodyFields.filter((field) => body[field] !== undefined);
+    if (attemptedCustodyFields.length > 0) {
+      return NextResponse.json({
+        success: false,
+        error: `Tool custody fields (${attemptedCustodyFields.join(', ')}) cannot be changed through generic edit; use the issue, return, repair/QC, transfer, or retirement workflow`,
+      }, { status: 400 });
+    }
+
+    // Generic edit is metadata-only. Custody mutations are workflow-controlled above.
     const updateData: Record<string, unknown> = {};
     const allowedFields = [
-      'name', 'description', 'category', 'serialNumber', 'condition',
-      'status', 'location', 'purchaseDate', 'purchaseCost', 'currentValue', 'manufacturer',
-      'model', 'assignedToId', 'expectedReturn', 'isActive', 'quantity',
+      'name', 'description', 'category', 'serialNumber',
+      'location', 'purchaseDate', 'purchaseCost', 'currentValue', 'manufacturer',
+      'model',
     ];
 
     for (const field of allowedFields) {

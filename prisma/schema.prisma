@@ -1370,7 +1370,8 @@ model Tool {
   serialNumber   String?   @unique
   status         String    @default("available") // available, checked_out, in_repair, retired, transferred
   condition      String    @default("good") // new, good, fair, poor
-  quantity       Int       @default(1) // Number of units available in stock
+  quantity       Int       @default(1) // Usable/issuable units available in stock
+  repairQuantity Int       @default(0) // Units held out of usable stock for repair/QC
   location       String?
   plantId        String?
   purchaseDate   DateTime?
@@ -2877,6 +2878,8 @@ model DamagedToolReport {
   damageSeverity  String   @default("medium") // low, medium, high, critical
   damageDescription String  @db.Text
   damagePhotoUrls String   @default("[]") @db.Text // JSON array of photo URLs
+  quantity         Int      @default(1) // physical damaged units represented by this report
+  repairHeldQuantity Int    @default(0) // units currently held in Tool.repairQuantity for this report
   occurredAt      DateTime?
   reportedById    String   // → User
   technicianId    String?  // → User (technician responsible, if different)
@@ -2889,6 +2892,9 @@ model DamagedToolReport {
   repairStartedAt DateTime?
   repairCompletedAt DateTime?
   repairCompletedById String?
+  qcAcceptedById String?
+  qcAcceptedAt   DateTime?
+  qcNotes        String?  @db.Text
   writtenOffById  String?
   writtenOffAt    DateTime?
   writeOffReason  String?
