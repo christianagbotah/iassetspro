@@ -144,6 +144,31 @@ describe('material custody CAS', () => {
     expect(tx.repairMaterialRequest.updateMany).not.toHaveBeenCalled();
   });
 
+  it('quarantines a damaged direct material return instead of restocking it', async () => {
+    const req = material();
+    tx.repairMaterialRequest.findUnique.mockResolvedValue(req);
+    tx.sparePartReturn.create.mockResolvedValue({ id: 'hold-direct', status: 'pending', conditionOnReturn: 'defective' });
+    tx.repairMaterialRequest.findUniqueOrThrow.mockResolvedValue({ ...req, quantityReturned: 2, status: 'partially_returned' });
+
+    const result = await recordMaterialReturn('mat-1', 'store-1', 2, {
+      notes: 'Failed visual inspection',
+      condition: 'defective',
+    });
+
+    expect(result.returnedToStock).toBe(0);
+    expect(result.returnedToHold).toBe(2);
+    expect(tx.inventoryItem.updateMany).not.toHaveBeenCalled();
+    expect(tx.stockMovement.create).not.toHaveBeenCalled();
+    expect(tx.sparePartReturn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        materialRequestId: 'mat-1',
+        quantity: 2,
+        conditionOnReturn: 'defective',
+        refurbishmentNeeded: true,
+      }),
+    }));
+  });
+
   it('turns a stale consumption write into a conflict', async () => {
     tx.repairMaterialRequest.findUnique.mockResolvedValue(material({ consumedQty: 2 }));
     tx.repairMaterialRequest.updateMany.mockResolvedValue({ count: 0 });
@@ -163,6 +188,34 @@ describe('material reconciliation delta', () => {
     expect(result.additionalReturn).toBe(3);
     expect(tx.inventoryItem.updateMany).toHaveBeenCalledWith({ where: { id: 'inv-1', currentStock: 20 }, data: { currentStock: 23 } });
     expect(tx.stockMovement.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ quantity: 3, previousStock: 20, newStock: 23 }) }));
+  });
+
+  it('quarantines a damaged reconciliation return instead of crediting usable inventory', async () => {
+    const req = material({ quantityIssued: 10, consumedQty: 3, wastedQty: 1, quantityReturned: 2 });
+    tx.repairMaterialRequest.findUnique.mockResolvedValue(req);
+    tx.sparePartReturn.create.mockResolvedValue({ id: 'hold-1', status: 'pending', conditionOnReturn: 'damaged' });
+    tx.repairMaterialRequest.findUniqueOrThrow.mockResolvedValue({ ...req, consumedQty: 4, wastedQty: 1, quantityReturned: 5, status: 'closed' });
+
+    const result = await reconcileMaterialRequest('mat-1', 'store-1', 4, 1, 'Housing cracked on return', 'damaged');
+
+    expect(result.additionalReturn).toBe(3);
+    expect(result.additionalReturnedToStock).toBe(0);
+    expect(result.additionalReturnedToHold).toBe(3);
+    expect(tx.inventoryItem.updateMany).not.toHaveBeenCalled();
+    expect(tx.stockMovement.create).not.toHaveBeenCalled();
+    expect(tx.sparePartReturn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        materialRequestId: 'mat-1',
+        itemId: 'inv-1',
+        workOrderId: 'wo-1',
+        plantId: 'plant-1',
+        itemName: 'Bearing',
+        quantity: 3,
+        conditionOnReturn: 'damaged',
+        status: 'pending',
+        refurbishmentNeeded: true,
+      }),
+    }));
   });
 
   it('makes exact closed reconciliation replay a no-op', async () => {

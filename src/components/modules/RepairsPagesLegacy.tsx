@@ -217,13 +217,14 @@ function RejectDialog({ open, onClose, onConfirm, title }: {
 }
 
 function QuantityDialog({ open, onClose, onConfirm, title, description, max, fieldLabel }: {
-  open: boolean; onClose: () => void; onConfirm: (qty: number) => void;
+  open: boolean; onClose: () => void; onConfirm: (qty: number, condition: string) => void;
   title: string; description: string; max: number; fieldLabel: string;
 }) {
   const [value, setValue] = useState('');
-  useEffect(() => { if (!open) setValue(''); }, [open]);
+  const [condition, setCondition] = useState('');
+  useEffect(() => { if (!open) { setValue(''); setCondition(''); } }, [open]);
   const q = parseFloat(value);
-  const valid = !isNaN(q) && q > 0 && q <= max;
+  const valid = !isNaN(q) && q > 0 && q <= max && !!condition;
   return (
     <ResponsiveDialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       
@@ -233,12 +234,23 @@ function QuantityDialog({ open, onClose, onConfirm, title, description, max, fie
           <Input type="number" value={value} onChange={e => setValue(e.target.value)} placeholder="Enter quantity" min={1} max={max} />
           <div className="flex justify-between text-xs text-muted-foreground">
             <span>Max available: {max}</span>
-            {valid && <span className="text-emerald-600 font-medium">{formatCurrency(q * 0)} estimated</span>}
+            {!isNaN(q) && q > 0 && q <= max && <span className="text-emerald-600 font-medium">Quantity valid</span>}
+          </div>
+          <div className="space-y-2 pt-2">
+            <Label>Return condition *</Label>
+            <Select value={condition} onValueChange={setCondition}>
+              <SelectTrigger><SelectValue placeholder="Select physical condition" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="serviceable">Serviceable — return to usable stock</SelectItem>
+                <SelectItem value="damaged">Damaged — quarantine for inspection / repair</SelectItem>
+                <SelectItem value="defective">Defective — quarantine for inspection / repair</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
         <div className="flex flex-col-reverse gap-2 mt-4 sm:flex-row sm:justify-end">
           <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button className="bg-emerald-600 hover:bg-emerald-700 text-white" disabled={!valid} onClick={() => { onConfirm(q); onClose(); }}>Confirm</Button>
+          <Button className="bg-emerald-600 hover:bg-emerald-700 text-white" disabled={!valid} onClick={() => { onConfirm(q, condition); onClose(); }}>Confirm</Button>
         </div>
       
     </ResponsiveDialog>
@@ -507,7 +519,7 @@ export function RepairMaterialRequestsPage() {
   const [createForm, setCreateForm] = useState({ workOrderId: '', itemName: '', itemId: '', componentRegistryId: '', quantityRequested: '', unit: 'each', unitCost: '', reason: '', notes: '', urgency: 'medium' });
   const [reconcileOpen, setReconcileOpen] = useState(false);
   const [reconcileTarget, setReconcileTarget] = useState<any>(null);
-  const [reconcileForm, setReconcileForm] = useState({ consumedQty: '', wastedQty: '', notes: '' });
+  const [reconcileForm, setReconcileForm] = useState({ consumedQty: '', wastedQty: '', returnCondition: '', notes: '' });
   const [usageDeclarationOpen, setUsageDeclarationOpen] = useState(false);
   const [usageDeclarationTarget, setUsageDeclarationTarget] = useState<any>(null);
   const [usageDeclarationForm, setUsageDeclarationForm] = useState({ consumedQty: '', wastedQty: '0', returnQty: '', notes: '' });
@@ -659,6 +671,7 @@ export function RepairMaterialRequestsPage() {
     setReconcileForm({
       consumedQty: String(target?.declaredConsumedQty ?? target?.consumedQty ?? ''),
       wastedQty: String(target?.declaredWastedQty ?? target?.wastedQty ?? 0),
+      returnCondition: '',
       notes: target?.usageDeclarationNotes || '',
     });
     setReconcileOpen(true);
@@ -674,11 +687,18 @@ export function RepairMaterialRequestsPage() {
       toast.error(`Consumed + wasted (${consumed + wasted}) cannot exceed issued (${reconcileTarget.quantityIssued})`);
       return;
     }
+    const targetReturned = Math.max(0, Number(reconcileTarget.quantityIssued || 0) - consumed - wasted);
+    const additionalReturn = Math.max(0, targetReturned - Number(reconcileTarget.quantityReturned || 0));
+    if (additionalReturn > 0.001 && !reconcileForm.returnCondition) {
+      toast.error('Select the physical condition of the material being returned');
+      return;
+    }
     setSubmitting(true);
     const res = await api.post('/api/repairs/material-requests/reconcile', {
       id: reconcileTarget.id,
       consumedQty: consumed,
       wastedQty: wasted > 0 ? wasted : undefined,
+      returnCondition: reconcileForm.returnCondition || undefined,
       notes: reconcileForm.notes || undefined,
     });
     if (res.success) {
@@ -687,7 +707,7 @@ export function RepairMaterialRequestsPage() {
         : 'Reconciliation completed');
       setReconcileOpen(false);
       setReconcileTarget(null);
-      setReconcileForm({ consumedQty: '', wastedQty: '', notes: '' });
+      setReconcileForm({ consumedQty: '', wastedQty: '', returnCondition: '', notes: '' });
       fetchRequests();
       if (detailOpen) setDetailOpen(false);
     } else toast.error(res.error || 'Failed to reconcile');
@@ -1041,7 +1061,7 @@ export function RepairMaterialRequestsPage() {
       </ResponsiveDialog>
 
       <RejectDialog open={rejectOpen} onClose={() => { setRejectOpen(false); setRejectTarget(null); }} onConfirm={(reason) => { if (rejectTarget) handleAction(rejectTarget.id, rejectTarget.action, { notes: reason }); }} title="Reject Material Request" />
-      <QuantityDialog open={qtyOpen} onClose={() => { setQtyOpen(false); setQtyTarget(null); }} onConfirm={(qty) => { if (qtyTarget) handleAction(qtyTarget.id, qtyTarget.action, { [qtyTarget.field]: qty }); }} title="Return Quantity" description={`Enter quantity to return (max ${qtyTarget?.max || 0})`} max={qtyTarget?.max || 0} fieldLabel="Quantity to Return" />
+      <QuantityDialog open={qtyOpen} onClose={() => { setQtyOpen(false); setQtyTarget(null); }} onConfirm={(qty, condition) => { if (qtyTarget) handleAction(qtyTarget.id, qtyTarget.action, { [qtyTarget.field]: qty, returnCondition: condition }); }} title="Return Quantity" description={`Enter quantity and verify its physical condition (max ${qtyTarget?.max || 0})`} max={qtyTarget?.max || 0} fieldLabel="Quantity to Return" />
 
       {/* Technician Material Usage Declaration */}
       <ResponsiveDialog open={usageDeclarationOpen} onOpenChange={(v) => { if (!v) { setUsageDeclarationOpen(false); setUsageDeclarationTarget(null); setUsageDeclarationForm({ consumedQty: '', wastedQty: '0', returnQty: '', notes: '' }); } }}>
@@ -1085,7 +1105,7 @@ export function RepairMaterialRequestsPage() {
       </ResponsiveDialog>
 
       {/* Reconciliation Dialog */}
-      <ResponsiveDialog open={reconcileOpen} onOpenChange={(v) => { if (!v) { setReconcileOpen(false); setReconcileTarget(null); setReconcileForm({ consumedQty: '', wastedQty: '', notes: '' }); } }}>
+      <ResponsiveDialog open={reconcileOpen} onOpenChange={(v) => { if (!v) { setReconcileOpen(false); setReconcileTarget(null); setReconcileForm({ consumedQty: '', wastedQty: '', returnCondition: '', notes: '' }); } }}>
         
           <div className="space-y-1.5 mb-4">
             <h2 className="text-lg font-semibold leading-none tracking-tight">Verify Return & Reconcile</h2>
@@ -1139,14 +1159,28 @@ export function RepairMaterialRequestsPage() {
                 )}
               </div>
             )}
+            {Math.max(0, Number(reconcileTarget?.quantityIssued || 0) - (parseFloat(reconcileForm.consumedQty) || 0) - (parseFloat(reconcileForm.wastedQty) || 0) - Number(reconcileTarget?.quantityReturned || 0)) > 0.001 && (
+              <div className="space-y-2">
+                <Label>Return condition *</Label>
+                <Select value={reconcileForm.returnCondition} onValueChange={(value) => setReconcileForm(f => ({ ...f, returnCondition: value }))}>
+                  <SelectTrigger><SelectValue placeholder="Verify physical condition before store acceptance" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="serviceable">Serviceable — return to usable stock</SelectItem>
+                    <SelectItem value="damaged">Damaged — quarantine for inspection / repair</SelectItem>
+                    <SelectItem value="defective">Defective — quarantine for inspection / repair</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">Damaged or defective items stay outside usable inventory until inspection/refurbishment custody releases them.</p>
+              </div>
+            )}
             <div>
               <Label>Notes</Label>
               <Textarea value={reconcileForm.notes} onChange={e => setReconcileForm(f => ({ ...f, notes: e.target.value }))} placeholder="Optional notes about consumption..." rows={2} />
             </div>
           </div>
           <div className="flex flex-col-reverse gap-2 mt-4 sm:flex-row sm:justify-end">
-            <Button variant="outline" onClick={() => { setReconcileOpen(false); setReconcileTarget(null); setReconcileForm({ consumedQty: '', wastedQty: '', notes: '' }); }}>Cancel</Button>
-            <Button className="bg-violet-600 hover:bg-violet-700 text-white gap-2" onClick={handleReconcile} disabled={submitting || !reconcileForm.consumedQty}>
+            <Button variant="outline" onClick={() => { setReconcileOpen(false); setReconcileTarget(null); setReconcileForm({ consumedQty: '', wastedQty: '', returnCondition: '', notes: '' }); }}>Cancel</Button>
+            <Button className="bg-violet-600 hover:bg-violet-700 text-white gap-2" onClick={handleReconcile} disabled={submitting || !reconcileForm.consumedQty || (Math.max(0, Number(reconcileTarget?.quantityIssued || 0) - (parseFloat(reconcileForm.consumedQty) || 0) - (parseFloat(reconcileForm.wastedQty) || 0) - Number(reconcileTarget?.quantityReturned || 0)) > 0.001 && !reconcileForm.returnCondition)}>
               <PackageCheck className="h-4 w-4" /> Confirm Reconciliation
             </Button>
           </div>

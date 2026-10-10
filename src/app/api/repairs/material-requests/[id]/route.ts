@@ -274,7 +274,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (!plantAuth.ok) return plantAuth.response;
 
     const body = await request.json();
-    const { action, approvedQuantity, quantityApproved, quantityReturned, consumedQty, wastedQty, returnQty, notes } = body;
+    const { action, approvedQuantity, quantityApproved, quantityReturned, consumedQty, wastedQty, returnQty, notes, returnCondition } = body;
 
     const matReq = await db.repairMaterialRequest.findUnique({
       where: { id },
@@ -428,10 +428,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
       case 'record_return': {
         const qtyToReturn = approvedQuantity ?? quantityApproved ?? quantityReturned ?? 0;
-        const result = await recordMaterialReturn(id, session.userId, qtyToReturn, { notes });
+        if (!['serviceable', 'damaged', 'defective'].includes(returnCondition)) {
+          return NextResponse.json({ success: false, error: 'Return condition is required' }, { status: 400 });
+        }
+        const result = await recordMaterialReturn(id, session.userId, qtyToReturn, { notes, condition: returnCondition });
         updated = result.updated;
-        await db.auditLog.create({ data: { userId: session.userId, action: 'material_request_record_return', entityType: 'repair_material_request', entityId: id, newValues: JSON.stringify({ action: 'record_return', status: result.newStatus, returnQuantity: qtyToReturn, previousReturned: result.previousReturned, cumulativeReturned: result.cumulativeReturned, quantityIssued: matReq.quantityIssued, itemId: matReq.itemId || null }) } });
-        await notifyUser(matReq.requestedById, 'repair_material_request', result.newStatus === 'fully_returned' ? 'All Materials Returned' : 'Partial Material Return Recorded', result.newStatus === 'fully_returned' ? `All ${matReq.quantityIssued} ${matReq.unit} of ${matReq.itemName} returned for WO ${matReq.workOrder.woNumber}` : `${qtyToReturn} ${matReq.unit} of ${matReq.itemName} returned for WO ${matReq.workOrder.woNumber}. Total returned: ${result.cumulativeReturned}/${matReq.quantityIssued}`, 'repair_material_request', id, `material-requests?id=${id}`);
+        await db.auditLog.create({ data: { userId: session.userId, action: 'material_request_record_return', entityType: 'repair_material_request', entityId: id, newValues: JSON.stringify({ action: 'record_return', status: result.newStatus, returnQuantity: qtyToReturn, previousReturned: result.previousReturned, cumulativeReturned: result.cumulativeReturned, quantityIssued: matReq.quantityIssued, itemId: matReq.itemId || null, returnCondition: result.returnCondition, returnedToStock: result.returnedToStock, returnedToHold: result.returnedToHold, returnHoldId: result.returnHold?.id ?? null }) } });
+        const destination = result.returnedToHold > 0 ? 'inspection hold' : 'usable store stock';
+        await notifyUser(matReq.requestedById, 'repair_material_request', result.newStatus === 'fully_returned' ? 'All Materials Returned' : 'Partial Material Return Recorded', result.newStatus === 'fully_returned' ? `All ${matReq.quantityIssued} ${matReq.unit} of ${matReq.itemName} returned to ${destination} for WO ${matReq.workOrder.woNumber}` : `${qtyToReturn} ${matReq.unit} of ${matReq.itemName} returned to ${destination} for WO ${matReq.workOrder.woNumber}. Total returned: ${result.cumulativeReturned}/${matReq.quantityIssued}`, 'repair_material_request', id, `material-requests?id=${id}`);
         break;
       }
 

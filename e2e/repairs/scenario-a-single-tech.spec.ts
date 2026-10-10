@@ -388,7 +388,7 @@ test('UAT-01: Scenario A — Single-Tech Full Lifecycle', async ({ browser }) =>
         storeToken,
         'POST',
         `/api/repairs/material-requests/${materialRequestId}`,
-        { action: 'record_return', quantityReturned: 1 },
+        { action: 'record_return', quantityReturned: 1, returnCondition: 'serviceable' },
       );
       expect(returnStatus).toBe(200);
 

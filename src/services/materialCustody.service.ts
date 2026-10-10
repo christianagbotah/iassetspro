@@ -1,5 +1,6 @@
 import { db } from '@/lib/db';
 import type { Prisma } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 
 const EPSILON = 0.001;
 type Tx = Prisma.TransactionClient;
@@ -30,6 +31,51 @@ const materialInclude = {
   requestedBy: { select: { id: true, fullName: true } },
   item: { select: { id: true, itemCode: true, name: true, currentStock: true, plantId: true } },
 } satisfies Prisma.RepairMaterialRequestInclude;
+
+export type MaterialReturnCondition = 'serviceable' | 'damaged' | 'defective';
+
+type MaterialRequestWithContext = Prisma.RepairMaterialRequestGetPayload<{ include: typeof materialInclude }>;
+
+function normalizeReturnCondition(value: string | null | undefined): MaterialReturnCondition {
+  const normalized = (value || 'serviceable').trim().toLowerCase();
+  if (!['serviceable', 'damaged', 'defective'].includes(normalized)) {
+    throw new MaterialCustodyValidationError('Return condition must be serviceable, damaged, or defective');
+  }
+  return normalized as MaterialReturnCondition;
+}
+
+function requiresReturnQualityHold(condition: MaterialReturnCondition): boolean {
+  return condition === 'damaged' || condition === 'defective';
+}
+
+async function createMaterialReturnQualityHold(
+  tx: Tx,
+  request: MaterialRequestWithContext,
+  actorId: string,
+  quantity: number,
+  condition: MaterialReturnCondition,
+  notes?: string | null,
+) {
+  const now = new Date();
+  const returnNumber = `SPR-AUTO-${now.getTime().toString(36).toUpperCase()}-${randomUUID().slice(0, 8).toUpperCase()}`;
+  return tx.sparePartReturn.create({
+    data: {
+      returnNumber,
+      workOrderId: request.workOrderId,
+      componentId: request.componentRegistryId || null,
+      materialRequestId: request.id,
+      itemId: request.itemId || null,
+      itemName: request.itemName,
+      quantity,
+      conditionOnReturn: condition,
+      damageDescription: notes?.trim() || null,
+      refurbishmentNeeded: true,
+      plantId: request.workOrder.plantId || request.plantId || null,
+      requestedById: request.requestedById || actorId,
+      status: 'pending',
+    },
+  });
+}
 
 function positiveQuantity(value: number, label: string): number {
   if (!Number.isFinite(value) || value <= 0) {
@@ -209,11 +255,13 @@ export async function recordMaterialReturn(
   requestId: string,
   actorId: string,
   quantity: number,
-  options: { notes?: string | null; creditInventory?: boolean; referenceType?: string; referenceId?: string } = {},
+  options: { notes?: string | null; creditInventory?: boolean; referenceType?: string; referenceId?: string; condition?: MaterialReturnCondition } = {},
 ) {
   const qty = positiveQuantity(quantity, 'Return quantity');
   const now = new Date();
-  const creditInventory = options.creditInventory !== false;
+  const returnCondition = normalizeReturnCondition(options.condition);
+  const qualityHold = requiresReturnQualityHold(returnCondition);
+  const creditInventory = options.creditInventory !== false && !qualityHold;
 
   return db.$transaction(async (tx) => {
     const request = await tx.repairMaterialRequest.findUnique({ where: { id: requestId }, include: materialInclude });
@@ -251,7 +299,10 @@ export async function recordMaterialReturn(
     });
     if (claim.count !== 1) throw new MaterialCustodyConflictError('Material custody changed concurrently');
 
-    if (creditInventory && request.itemId) {
+    let returnHold: { id: string } | null = null;
+    if (qualityHold) {
+      returnHold = await createMaterialReturnQualityHold(tx, request, actorId, qty, returnCondition, options.notes);
+    } else if (creditInventory && request.itemId) {
       await mutateInventory(tx, {
         itemId: request.itemId,
         delta: qty,
@@ -265,7 +316,11 @@ export async function recordMaterialReturn(
     }
 
     const updated = await tx.repairMaterialRequest.findUniqueOrThrow({ where: { id: requestId }, include: materialInclude });
-    return { updated, previousReturned, cumulativeReturned, newStatus };
+    return {
+      updated, previousReturned, cumulativeReturned, newStatus, returnCondition, returnHold,
+      returnedToStock: creditInventory && request.itemId ? qty : 0,
+      returnedToHold: qualityHold ? qty : 0,
+    };
   });
 }
 
@@ -325,11 +380,14 @@ export async function reconcileMaterialRequest(
   consumedQty: number,
   wastedQty: number,
   notes?: string | null,
+  returnConditionInput: MaterialReturnCondition = 'serviceable',
 ) {
   if (!Number.isFinite(consumedQty) || consumedQty < 0 || !Number.isFinite(wastedQty) || wastedQty < 0) {
     throw new MaterialCustodyValidationError('Consumed and wasted quantities must be non-negative numbers');
   }
   const now = new Date();
+  const returnCondition = normalizeReturnCondition(returnConditionInput);
+  const qualityHold = requiresReturnQualityHold(returnCondition);
 
   return db.$transaction(async (tx) => {
     const request = await tx.repairMaterialRequest.findUnique({ where: { id: requestId }, include: materialInclude });
@@ -356,7 +414,10 @@ export async function reconcileMaterialRequest(
       Math.abs((request.wastedQty ?? 0) - wastedQty) <= EPSILON && additionalReturn <= EPSILON;
 
     if (request.status === 'closed' && exactReplay) {
-      return { updated: request, issuedQty: issued, existingReturned, targetReturned, additionalReturn: 0, replay: true };
+      return {
+        updated: request, issuedQty: issued, existingReturned, targetReturned, additionalReturn: 0, replay: true,
+        returnCondition, returnHold: null, additionalReturnedToStock: 0, additionalReturnedToHold: 0,
+      };
     }
 
     const total = consumedQty + wastedQty + targetReturned;
@@ -383,7 +444,13 @@ export async function reconcileMaterialRequest(
     });
     if (claim.count !== 1) throw new MaterialCustodyConflictError('Material reconciliation changed concurrently');
 
-    if (additionalReturn > EPSILON && request.itemId) {
+    let returnHold: { id: string } | null = null;
+    if (additionalReturn > EPSILON && qualityHold) {
+      returnHold = await createMaterialReturnQualityHold(
+        tx, request, actorId, additionalReturn, returnCondition,
+        notes || `Reconciliation return: ${additionalReturn} ${request.unit}`,
+      );
+    } else if (additionalReturn > EPSILON && request.itemId) {
       await mutateInventory(tx, {
         itemId: request.itemId,
         delta: additionalReturn,
@@ -397,7 +464,12 @@ export async function reconcileMaterialRequest(
     }
 
     const updated = await tx.repairMaterialRequest.findUniqueOrThrow({ where: { id: requestId }, include: materialInclude });
-    return { updated, issuedQty: issued, existingReturned, targetReturned, additionalReturn, replay: false };
+    return {
+      updated, issuedQty: issued, existingReturned, targetReturned, additionalReturn, replay: false,
+      returnCondition, returnHold,
+      additionalReturnedToStock: !qualityHold && request.itemId ? additionalReturn : 0,
+      additionalReturnedToHold: qualityHold ? additionalReturn : 0,
+    };
   });
 }
 
