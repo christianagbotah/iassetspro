@@ -1,0 +1,14 @@
+name: Presentation Evidence
+on:
+  push:
+    branches: [docs/presentation-evidence-20261011]
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iassetspro-presentation-screenshots
+          path: docs/presentation-screenshots/
+          retention-days: 2
