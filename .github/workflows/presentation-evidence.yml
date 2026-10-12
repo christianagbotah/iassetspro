@@ -11,4 +11,9 @@ jobs:
         with:
           name: iassetspro-presentation-screenshots
           path: docs/presentation-screenshots/
-          retention-days: 2
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iassetspro-presentation-pack
+          path: docs/presentation-pack/
+          retention-days: 7
