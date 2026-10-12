@@ -106,7 +106,7 @@ export async function GET(request: NextRequest) {
     // ── Compute compliance rate ──
     // PM WOs completed on or before their planned end date
     const completedPmWos = pmWorkOrders.filter(
-      (wo) => wo.status === 'completed' || wo.status === 'closed',
+      (wo) => wo.status === 'completed' || wo.status === 'verified' || wo.status === 'closed',
     );
     const complianceEligibleWos = completedPmWos.filter((wo) => wo.actualEnd && wo.plannedEnd);
     const completedOnTime = complianceEligibleWos.filter(
@@ -141,7 +141,15 @@ export async function GET(request: NextRequest) {
 
     const deptNameMap = new Map(deptNames.map((d) => [d.id, d]));
 
-    // Compute per-department compliance
+    // Keep completed-WO totals independent from compliance eligibility.
+    const deptCompletedMap = new Map<string, number>();
+    for (const wo of completedPmWos) {
+      const dId = wo.departmentId;
+      if (!dId) continue;
+      deptCompletedMap.set(dId, (deptCompletedMap.get(dId) || 0) + 1);
+    }
+
+    // Compute per-department compliance only from work with a measurable planned window.
     const deptComplianceMap = new Map<string, { total: number; onTime: number }>();
     for (const wo of complianceEligibleWos) {
       const dId = wo.departmentId;
@@ -162,7 +170,7 @@ export async function GET(request: NextRequest) {
         departmentName: dept?.name || 'Unknown',
         departmentCode: dept?.code || '—',
         scheduleCount: d._count.id,
-        completedWos: compliance?.total || 0,
+        completedWos: deptCompletedMap.get(d.departmentId!) || 0,
         complianceRate: compliance && compliance.total > 0
           ? Math.round((compliance.onTime / compliance.total) * 100)
           : null,
@@ -174,14 +182,24 @@ export async function GET(request: NextRequest) {
     // the PostgreSQL migration (the legacy implementation used MySQL DATE_FORMAT).
     const trendMap = new Map<string, { generated: number; completed: number }>();
     const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+
     for (const wo of pmWorkOrders) {
       const createdAt = new Date(wo.createdAt);
       if (createdAt < twelveMonthsAgo) continue;
-      const key = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}`;
-      const entry = trendMap.get(key) || { generated: 0, completed: 0 };
+      const generatedKey = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}`;
+      const entry = trendMap.get(generatedKey) || { generated: 0, completed: 0 };
       entry.generated += 1;
-      if (wo.actualEnd) entry.completed += 1;
-      trendMap.set(key, entry);
+      trendMap.set(generatedKey, entry);
+    }
+
+    for (const wo of completedPmWos) {
+      if (!wo.actualEnd) continue;
+      const completedAt = new Date(wo.actualEnd);
+      if (completedAt < twelveMonthsAgo || completedAt > now) continue;
+      const completionKey = `${completedAt.getFullYear()}-${String(completedAt.getMonth() + 1).padStart(2, '0')}`;
+      const entry = trendMap.get(completionKey) || { generated: 0, completed: 0 };
+      entry.completed += 1;
+      trendMap.set(completionKey, entry);
     }
     const monthlyTrend: Array<{ month: string; generated: number; completed: number }> = [];
     for (let i = 11; i >= 0; i--) {

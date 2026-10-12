@@ -29,6 +29,23 @@ describe('PM planned window and compliance contract', () => {
     expect(analytics).not.toContain('if (!wo.actualEnd || !wo.plannedEnd) return true');
   });
 
+  it('treats verified PM work orders as completed compliance outcomes', () => {
+    expect(analytics).toContain("wo.status === 'verified'");
+  });
+
+  it('keeps department completed-WO totals separate from compliance eligibility', () => {
+    expect(analytics).toContain('deptCompletedMap');
+    expect(analytics).toContain('for (const wo of completedPmWos)');
+    expect(analytics).toContain('completedWos: deptCompletedMap.get(d.departmentId!) || 0');
+    expect(analytics).toContain('for (const wo of complianceEligibleWos)');
+  });
+
+  it('buckets monthly PM completions by actual completion month', () => {
+    expect(analytics).toContain('const completionKey =');
+    expect(analytics).toContain('const completedAt = new Date(wo.actualEnd)');
+    expect(analytics).not.toContain('if (wo.actualEnd) entry.completed += 1');
+  });
+
   it('shows unavailable compliance as N/A rather than a false 0 or 100 percent', () => {
     expect(ui).toContain("pmAnalytics.complianceRate == null ? 'N/A'");
   });
