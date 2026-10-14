@@ -33,8 +33,8 @@ describe('asset functional-location assignment history schema', () => {
   it('uses a database partial unique index for one active assignment per asset and hierarchy system', () => {
     const migration = read('prisma/migrations/20261014090000_asset_functional_location_assignments/migration.sql');
     expect(migration).toContain('CREATE UNIQUE INDEX');
-    expect(migration).toContain('asset_id');
-    expect(migration).toContain('hierarchy_system_id');
-    expect(migration).toMatch(/WHERE\s+"effective_to"\s+IS\s+NULL/i);
+    expect(migration).toContain('"assetId"');
+    expect(migration).toContain('"hierarchySystemId"');
+    expect(migration).toMatch(/WHERE\s+"effectiveTo"\s+IS\s+NULL/i);
   });
 });
