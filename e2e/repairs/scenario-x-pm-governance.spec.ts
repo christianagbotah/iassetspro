@@ -99,10 +99,10 @@ test('UAT-23: PM plan governance preserves lifecycle locks and editable template
     await rowAfterEdit.getByRole('button').last().click();
     await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
     await page.getByRole('button', { name: /Task Library Checklist/i }).click();
-    await expect(page.getByText(firstTask, { exact: true })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText(lastTask, { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(`Task Description: ${firstTask}`, { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(`Task Description: ${lastTask}`, { exact: true })).toBeVisible({ timeout: 10_000 });
 
-    const firstTaskRow = page.getByText(firstTask, { exact: true }).locator('xpath=ancestor::div[contains(@class,"rounded-xl")][1]');
+    const firstTaskRow = page.getByText(`Task Description: ${firstTask}`, { exact: true }).locator('xpath=ancestor::div[contains(@class,"rounded-xl")][1]');
     await firstTaskRow.getByRole('button', { name: 'Remove from Template', exact: true }).click();
     const firstDelete = page.waitForResponse((response) =>
       response.url().includes(`/api/pm-templates/${templateId}/tasks/`)
@@ -110,10 +110,10 @@ test('UAT-23: PM plan governance preserves lifecycle locks and editable template
     );
     await page.getByRole('alertdialog').getByRole('button', { name: 'Remove from Template', exact: true }).click();
     expect((await firstDelete).status()).toBe(200);
-    await expect(page.getByText(firstTask, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(`Task Description: ${firstTask}`, { exact: true })).toHaveCount(0);
 
     // The last active task is protected while an active schedule still depends on this template.
-    const lastTaskRow = page.getByText(lastTask, { exact: true }).locator('xpath=ancestor::div[contains(@class,"rounded-xl")][1]');
+    const lastTaskRow = page.getByText(`Task Description: ${lastTask}`, { exact: true }).locator('xpath=ancestor::div[contains(@class,"rounded-xl")][1]');
     await lastTaskRow.getByRole('button', { name: 'Remove from Template', exact: true }).click();
     const blockedLastDelete = page.waitForResponse((response) =>
       response.url().includes(`/api/pm-templates/${templateId}/tasks/`)
@@ -121,7 +121,7 @@ test('UAT-23: PM plan governance preserves lifecycle locks and editable template
     );
     await page.getByRole('alertdialog').getByRole('button', { name: 'Remove from Template', exact: true }).click();
     expect((await blockedLastDelete).status()).toBe(409);
-    await expect(page.getByText(lastTask, { exact: true })).toBeVisible();
+    await expect(page.getByText(`Task Description: ${lastTask}`, { exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
 
     // Template deactivation is also blocked while the linked schedule remains active.
